@@ -8,6 +8,9 @@ using System.Threading.Tasks;
 
 namespace PNServer.Core.Network
 {
+/// <summary>
+///  Много писателей один читатель
+/// </summary>
     public unsafe class ConcurrentMemoryStream 
     {
         const int _controlInfoSize = sizeof(int);
@@ -200,12 +203,13 @@ namespace PNServer.Core.Network
                 head = _writeptr;
                 IntPtr rslt = head + _controlInfoSize + count_bytes;
 
+                // В буфере нет места ждем пока появится
                 if ((long)rslt > (long)_endPtr)
                 {
                     sw.SpinOnce(sleep1Threshold: -1);
                     continue;
                 }
-
+                // пытаемся зарезервировать кусок
                 if (Interlocked.CompareExchange(ref _writeptr, rslt, head) == head)
                     break;
 
@@ -214,8 +218,11 @@ namespace PNServer.Core.Network
 
             memcpyimpl((byte*)bf_1, (byte*)(head + _controlInfoSize), bf_1Size);
             memcpyimpl((byte*)bf_2, (byte*)(head + _controlInfoSize + bf_1Size), bf_2Size);
+
+            // копируем сами данные
             Interlocked.MemoryBarrier();
-            *(int*)head = (int)(count_bytes | 0x80000000);
+            *(int*)head = (int)(count_bytes | 0x80000000); 
+            // размер блока + флаг что все данные скопированы можно читать
 
         }
         public void Write(byte* buffer, int count_bytes)
@@ -227,13 +234,13 @@ namespace PNServer.Core.Network
             {
                 head = _writeptr;
                 IntPtr rslt = head + _controlInfoSize + count_bytes;
-
+                // В буфере нет места ждем пока появится
                 if ((long)rslt > (long)_endPtr)
                 {
                     sw.SpinOnce(sleep1Threshold: -1);
                     continue;
                 }
-
+                // пытаемся зарезервировать кусок
                 if (Interlocked.CompareExchange(ref _writeptr, rslt, head) == head)
                     break;
 
@@ -243,15 +250,25 @@ namespace PNServer.Core.Network
             
 
             memcpyimpl((byte*)buffer, (byte*)(head + _controlInfoSize), count_bytes);
+            // копируем сами данные
             Interlocked.MemoryBarrier();
+
             *(int*)head = (int)(count_bytes | 0x80000000);
+            // размер блока + флаг что все данные скопированы можно читать
         }
+        /// <summary>
+        /// Чтение только из одного потока
+        /// </summary>
+        /// <param name="_OutPut"></param>
+        /// <returns></returns>
         public int Read(byte* _OutPut)
         {
+            /// Проверяем пустой ли буфер
             if (_writeptr == _readptr)
             {
+                // если пустой пытаемся скинуть поинтер на запись в начало
                 IntPtr _r = Interlocked.CompareExchange(ref _writeptr, _hndl, _readptr);
-
+                // Если не вышло значит пока скидывались в буфере появились новые данные рекурсивно Read()
                 if (_r == _readptr)
                 {
                     _readptr = _hndl;
@@ -265,20 +282,26 @@ namespace PNServer.Core.Network
             int control_info;
             do
             {
+                // читаем контрольную информацию о блоке
                 control_info = *(int*)_readptr;
 
                 byte flag = (byte)((control_info & 0x80000000) >> 31);
-
+                // флаг закончена ли запись
                 if (flag == 1)
-                    break;
-
+                    break; 
+                // если нет ждем пока запись закончится
                 sw.SpinOnce(sleep1Threshold: -1);
             } while (true);
             
             control_info &= 0x7ffffff;
+            // получаем размер по битовой маске [0 - 1 073 741 824‬]
+
+            // читаем блок
             memcpyimpl((byte*)(_readptr + _controlInfoSize), _OutPut, control_info);
+            // заполняем весь прочитанный блок нулями
             zeromemoryimpl((byte*)_readptr, control_info + _controlInfoSize);
-            _readptr += control_info + _controlInfoSize;
+
+            _readptr += control_info + _controlInfoSize; // двигаемся дальше
             return control_info;
         }
     }
